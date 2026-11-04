@@ -10,7 +10,7 @@ import pytest
 
 
 @asynccontextmanager
-async def _running_queue(monkeypatch, *, foreign_profile_target=False):
+async def _running_queue(monkeypatch, *, foreign_profile_target=False, unserved_ingress=False):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
@@ -21,7 +21,17 @@ async def _running_queue(monkeypatch, *, foreign_profile_target=False):
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
-    runner = GatewayRunner(GatewayConfig())
+    config = GatewayConfig()
+    if unserved_ingress:
+        from gateway.profile_routing import ProfileRoute
+        from hermes_constants import get_hermes_home
+        config.multiplex_profiles = True
+        config._runtime_profile_homes = (("default", get_hermes_home()),)
+        config.profile_routes = [
+            ProfileRoute(name="unserved", platform="webhook", profile="unserved", user_id="webhook:fixture")]
+        monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve",
+                            lambda **kwargs: [("default", get_hermes_home())])
+    runner = GatewayRunner(config)
     discord = DiscordAdapter(PlatformConfig(enabled=True, token="fixture-token", typing_indicator=False))
     discord.gateway_runner = runner
     runner.adapters = {Platform.DISCORD: discord}
@@ -176,3 +186,75 @@ async def test_queue_routes_require_signatures_even_on_loopback(secret_scope):
             await webhook.connect()
     finally:
         await webhook.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_rejected_ingress_profile_cannot_borrow_the_launch_conversation(monkeypatch):
+    async with _running_queue(monkeypatch, unserved_ingress=True) as (
+            _runner, authority, _webhook, owner, url, _finish, _sent):
+        body = json.dumps({"text": "must not run in launch profile"}).encode()
+        async with aiohttp.ClientSession() as client:
+            response = await client.post(url, data=body, headers=_signed(body))
+            assert response.status == 503, await response.text()
+        rows = authority.db._read_all("SELECT target_session_id FROM session_admissions")
+        assert len(rows) == 1 and rows[0]["target_session_id"] == owner
+
+
+@pytest.mark.asyncio
+async def test_failed_handoff_restores_route_and_preserves_accepted_automation(monkeypatch):
+    import sqlite3
+    from gateway.session_authority import keyed_turn
+    from gateway.session_automation import reset_and_rehome_messages
+    from hermes_cli.heartbeat import HeartbeatState
+    from hermes_state_runtime import list_session_admissions
+    from tests.waiting import async_wait_until
+
+    async with _running_queue(monkeypatch) as (runner, authority, webhook, owner, url, finish, _sent):
+        finish.set()
+        await async_wait_until(
+            lambda: all(row["status"] == "terminal" for row in list_session_admissions(
+                authority.db, session_id=owner, pending_only=False)), timeout=10)
+        key = webhook._routes["fixture"]["queue_to_session"]
+        runner.session_store.set_model_override(key, {"model": "fixture-model"})
+        runner.session_store.set_session_yolo(key, False)
+        before = runner.session_store.lookup_by_session_key(key).to_dict()
+        gate = authority.sessions[owner].claim_gate
+        await gate.acquire()
+        try:
+            heartbeat = HeartbeatState(prompt="owned wake", interval_seconds=60, created_at=1000).to_json()
+            authority.db.set_meta("heartbeat:" + owner, heartbeat)
+            body = b'{"text":"durably accepted event"}'
+            async with aiohttp.ClientSession() as client:
+                response = await client.post(url, data=body, headers=_signed(body))
+                assert response.status == 202, await response.text()
+                receipt = (await response.json())["receipt"]["admission_id"]
+            authority.db._execute_write(lambda conn: conn.execute(
+                "CREATE TRIGGER fail_owned_rehome BEFORE UPDATE OF target_session_id ON session_admissions "
+                "WHEN OLD.target_session_id != NEW.target_session_id "
+                "BEGIN SELECT RAISE(ABORT, 'injected rehome write failure'); END"))
+            try:
+                async with keyed_turn(authority._route_turns, key):
+                    with pytest.raises(sqlite3.IntegrityError, match="injected rehome"):
+                        await reset_and_rehome_messages(runner, key, owner)
+            finally:
+                authority.db._execute_write(lambda conn: conn.execute("DROP TRIGGER fail_owned_rehome"))
+            assert runner.session_store.lookup_by_session_key(key).to_dict() == before
+            persisted = runner.session_store._routing_db._read_one(
+                "SELECT entry_json FROM gateway_routing WHERE scope=? AND session_key=?",
+                (runner.session_store._routing_scope(), key))
+            assert json.loads(persisted["entry_json"]) == before
+            assert authority.db.get_session(owner)["ended_at"] is None
+            pending = list_session_admissions(authority.db, session_id=owner)
+            assert [row["admission_id"] for row in pending] == [receipt]
+            assert authority.db.get_meta("heartbeat:" + owner) == heartbeat
+            assert owner not in authority.rotated_owners
+            async with keyed_turn(authority._route_turns, key):
+                successor, release = await reset_and_rehome_messages(runner, key, owner)
+            try:
+                assert [row["admission_id"] for row in list_session_admissions(
+                    authority.db, session_id=successor.session_id)] == [receipt]
+                assert json.loads(authority.db.get_meta("heartbeat:" + successor.session_id)) == json.loads(heartbeat)
+            finally:
+                release()
+        finally:
+            gate.release()

@@ -1137,11 +1137,12 @@ class SessionStore(
             return dict(entry.model_override) if entry and entry.model_override else None
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None, *,
-                      preserve_heartbeat: bool = False) -> Optional[SessionEntry]:
-        """Reset the conversation; automatic handoff may retain its heartbeat for transactional transfer."""
+                      preserve_heartbeat: bool = False,
+                      expected_entry: Optional[SessionEntry] = None) -> Optional[SessionEntry]:
+        """Reset the conversation, optionally guarding its snapshot and retaining heartbeat for transfer."""
         with self._lock:
             old_entry = self._entry_locked(session_key)
-            if old_entry is None:
+            if old_entry is None or (expected_entry is not None and old_entry is not expected_entry):
                 return None
             now = _now()
             session_id = _new_session_id(now)
@@ -1254,7 +1255,7 @@ class SessionStore(
     # restart-resume freshness gate (#85709).
     def switch_session(
         self, session_key: str, target_session_id: str, *, expected_session_id: Optional[str] = None,
-        preserve_prompt_pin: bool = True,
+        preserve_prompt_pin: bool = True, restore_entry: Optional[SessionEntry] = None,
     ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
         reopens the target so resume matches the CLI.
@@ -1263,8 +1264,14 @@ class SessionStore(
         the key no longer points at that session, so a caller that resolved against a snapshot
         across an await (async-delegation re-pin) cannot overwrite a concurrent /new or /resume.
         Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
-        starts a different conversation on the same routing key.
+        starts a different conversation on the same routing key. ``restore_entry`` restores an
+        exact pre-reset snapshot after a failed automatic handoff, with a mandatory CAS guard.
         """
+        if restore_entry is not None and (
+            expected_session_id is None or restore_entry.session_key != session_key
+            or restore_entry.session_id != target_session_id
+        ):
+            raise ValueError("A restored entry must match the guarded target route and session")
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
@@ -1277,15 +1284,20 @@ class SessionStore(
                 return None
             if old_entry.session_id == target_session_id:
                 return old_entry
-            new_entry = self._replace_route_locked(
-                session_key, old_entry, target_session_id, _now(),
-                display_name=old_entry.display_name, model_override=old_entry.model_override,
-                yolo=old_entry.yolo,
-                prompt_pin=(
-                    dict(old_entry.prompt_pin)
-                    if preserve_prompt_pin and old_entry.prompt_pin is not None else None
-                ),
-            )
+            if restore_entry is not None:
+                new_entry = restore_entry
+                self._entries[session_key] = new_entry
+                self._save()
+            else:
+                new_entry = self._replace_route_locked(
+                    session_key, old_entry, target_session_id, _now(),
+                    display_name=old_entry.display_name, model_override=old_entry.model_override,
+                    yolo=old_entry.yolo,
+                    prompt_pin=(
+                        dict(old_entry.prompt_pin)
+                        if preserve_prompt_pin and old_entry.prompt_pin is not None else None
+                    ),
+                )
 
         if self._db_for_key(session_key) and old_entry.session_id:
             self._promote_session_reset(
@@ -1296,9 +1308,12 @@ class SessionStore(
             # An explicit /resume/handoff/branch repoint is real user activity: the row is
             # reopened (a repoint onto a finalized row must resume it, not write into a dead row).
             # Mount-time reads (TUI session.resume) no longer reopen (#85303) — only this path does.
-            self._reopen_session_row(
-                session_key, target_session_id, log_prefix="Session DB reopen_session failed"
-            )
+            if restore_entry is not None:
+                self._db_for_key(session_key).reopen_session(target_session_id)
+            else:
+                self._reopen_session_row(
+                    session_key, target_session_id, log_prefix="Session DB reopen_session failed"
+                )
             self._record_gateway_session_peer(
                 target_session_id, session_key, new_entry.origin,
                 display_name=new_entry.display_name, include_compression_ancestors=True,

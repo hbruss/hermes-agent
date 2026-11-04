@@ -50,6 +50,8 @@ async def dispatch_queue_delivery(adapter, *, route_name: str, route_config: dic
                                      raw_message=payload, timestamp=datetime.fromtimestamp(0, UTC))
         from gateway.platforms.webhook_ingress import producer_scope
         async with producer_scope(adapter, ingress_event) as authority:
+            if getattr(ingress_event.source, "profile_route_rejected", False):
+                raise RuntimeStoreError("profile_mismatch")
             prompt = adapter._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
             if skills := route_config.get("skills", []):
                 prompt = adapter._apply_skills(prompt, skills)

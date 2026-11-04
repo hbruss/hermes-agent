@@ -174,6 +174,9 @@ agent-created dynamic subscriptions. It cannot be combined with `script`,
 `coalesce`, `cron_job`, `deliver_only`, or `mcp_event`. Automatic context-reset handoffs preserve queued webhook inputs,
 their retry identities and FIFO order, and the existing native session-heartbeat
 schedule. The successor remains behind its native claim gate during recentering.
+If the queued-input transfer fails, the error is reported after a guarded attempt
+to restore the preceding route and its settings, retaining accepted work for retry.
+This does not claim a crash-atomic transaction across the routing and session stores.
 An explicit `/new` or `/reset` remains a conversation boundary; it does not inherit
 the automatic handoff's route-provenance marker or heartbeat schedule.
 
