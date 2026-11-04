@@ -274,6 +274,9 @@ class WebhookAdapter(BasePlatformAdapter):
             raise ValueError(f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret but is bound to non-loopback "
                              f"host '{self._host}'. INSECURE_NO_AUTH is for local testing only. "
                              f"Refusing to start to prevent accidental exposure.")
+        if secret == _INSECURE_NO_AUTH and "queue_to_session" in route:
+            raise ValueError(f"[webhook] Route '{name}' queue_to_session requires authenticated evidence; "
+                             "INSECURE_NO_AUTH is not allowed.")
         if route.get("deliver_only"):
             deliver = route.get("deliver", "log")
             if not deliver or deliver == "log":

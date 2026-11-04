@@ -79,7 +79,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | Property | Required | Description |
 |----------|----------|-------------|
 | `events` | No | List of event types to accept (e.g. `["pull_request"]`). If empty, all events are accepted. Event type is read from `X-GitHub-Event`, `X-GitLab-Event`, or `event_type` in the payload. |
-| `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
+| `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation); not allowed with `queue_to_session`. |
 | `profile` | No | Profile authorized to execute this route when `gateway.multiplex_profiles` is enabled. Omit it for a default-profile-only route; set a profile name (for example `coder`) to bind the route and its secret to `/p/coder/webhooks/<route>`. Dynamic subscriptions set it with `hermes webhook subscribe <name> --route-profile coder`. |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
@@ -152,8 +152,9 @@ profile. It is a literal key, not a payload template. The destination's native
 tool permissions and reply channel apply; webhook `toolsets`, `deliver`,
 `deliver_extra`, and `mirror_to_session` do not create a second execution or reply
 route. Enable this only for an authenticated source appropriate for that
-conversation's capabilities. Event content remains labeled **untrusted evidence**,
-not a human instruction or new operating permission.
+conversation's capabilities; `INSECURE_NO_AUTH` is refused even on loopback.
+Event content remains labeled **untrusted evidence**, not a human instruction
+or new operating permission.
 
 Every request must supply a stable provider ID in `X-GitHub-Delivery`, `svix-id`,
 `webhook-id`, or `X-Request-ID`. HTTP 202 includes the native receipt only after
@@ -653,7 +654,7 @@ binds that secret to one execution target. A route without `profile` is
 default-profile-only. A request carrying a valid route signature is still
 rejected if its `/p/<profile>/` prefix does not match the route binding.
 
-`INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`). If it is combined with a non-loopback bind such as `0.0.0.0` or a LAN IP, the adapter refuses to start — this prevents accidentally exposing an unauthenticated endpoint on a public interface.
+`INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`) and the route does not use `queue_to_session`. A non-loopback bind such as `0.0.0.0` or a LAN IP, or a conversation queue route, causes the adapter to refuse startup. Queue routes always require signed evidence.
 
 ### Rate limiting
 

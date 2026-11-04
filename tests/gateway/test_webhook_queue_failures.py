@@ -156,3 +156,23 @@ async def test_dynamic_subscription_cannot_queue_into_an_existing_conversation(m
             assert response.status == 404, await response.text()
         rows = authority.db._read_all("SELECT target_session_id FROM session_admissions")
         assert len(rows) == 1 and rows[0]["target_session_id"] == owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret_scope", ["route", "global"])
+async def test_queue_routes_require_signatures_even_on_loopback(secret_scope):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+
+    route = {"queue_to_session": "agent:main:discord:dm:42", "prompt": "{text}"}
+    extra = {"host": "127.0.0.1", "port": 0, "secret": "fixture-secret", "routes": {"fixture": route}}
+    if secret_scope == "route":
+        route["secret"] = _INSECURE_NO_AUTH
+    else:
+        extra["secret"] = _INSECURE_NO_AUTH
+    webhook = WebhookAdapter(PlatformConfig(enabled=True, extra=extra))
+    try:
+        with pytest.raises(ValueError, match="queue_to_session.*authenticated"):
+            await webhook.connect()
+    finally:
+        await webhook.disconnect()
