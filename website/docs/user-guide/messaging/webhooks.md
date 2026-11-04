@@ -164,6 +164,10 @@ after an automatic handoff. Reusing an ID with changed evidence returns HTTP 409
 Unavailable targets, full queues, and failed native writes return a retryable
 HTTP 503, never a separate webhook agent run. Retired/deleted evidence that cannot
 prove an exact replay is refused rather than treated as a new delivery.
+Provider IDs establish retry idempotency, not a new cryptographic replay defense.
+Queue mode retains the receiver's existing provider authentication schemes,
+including GitLab token authentication; not every scheme signs the delivery ID or
+body. Use a source and transport appropriate for the destination's capabilities.
 
 Queue mode is restricted to operator-configured `config.yaml` routes, never
 agent-created dynamic subscriptions. It cannot be combined with `script`,
@@ -654,7 +658,7 @@ binds that secret to one execution target. A route without `profile` is
 default-profile-only. A request carrying a valid route signature is still
 rejected if its `/p/<profile>/` prefix does not match the route binding.
 
-`INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`) and the route does not use `queue_to_session`. A non-loopback bind such as `0.0.0.0` or a LAN IP, or a conversation queue route, causes the adapter to refuse startup. Queue routes always require signed evidence.
+`INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`) and the route does not use `queue_to_session`. A non-loopback bind such as `0.0.0.0` or a LAN IP, or a conversation queue route, causes the adapter to refuse startup. Queue routes always require authenticated requests.
 
 ### Rate limiting
 
