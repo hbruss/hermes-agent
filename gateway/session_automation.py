@@ -331,15 +331,20 @@ def _route_identity(source):
 
 
 def committed_route_envelope(authority, entry):
-    """The route's last committed native envelope with connector provenance (what a producer turn
-    borrows), or ``None`` while no human message was admitted there."""
+    """Committed native provenance for this owner, including its automatic-reset inheritance.
+
+    Manual /new and unrelated conversations do not inherit the automatic-reset marker.
+    """
     from hermes_state_runtime import list_session_admissions
     # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip.
     prior = list_session_admissions(authority.db, session_id=authority.logical_owner(entry.session_id),
                                     pending_only=False)
     envelope = next((r['payload']['native_text_v1'] for r in reversed(prior)
                      if 'native_text_v1' in r['payload']), None)
-    return envelope if envelope is not None and 'provenance' in envelope else None
+    if envelope is not None:
+        return envelope if 'provenance' in envelope else None
+    from hermes_state_route_rehome import load_route_provenance
+    return load_route_provenance(authority.db, authority.logical_owner(entry.session_id), entry.session_key)
 
 
 def snapshot_automation(authority, adapter, event, identity):
@@ -599,7 +604,7 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     from hermes_state_runtime import rehome_queued_inputs
 
     def rotate_and_move():
-        entry = runner.session_store.reset_session(session_key)
+        entry = runner.session_store.reset_session(session_key, preserve_heartbeat=True)
         if entry is None:
             return None, None, []
         new = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
@@ -611,7 +616,8 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
         authority.rotated_owners[old.session_id] = session_key
         return entry, new, rehome_queued_inputs(
             authority.db, epoch=authority.epoch, old_session_id=old.session_id,
-            new_session_id=new.session_id, principal_prefix='messaging:')
+            new_session_id=new.session_id, principal_prefix='messaging:',
+            route_key=session_key, heartbeat_session_id=old_session_id)
 
     async def fence(result):
         # In the write's own task step, before any later ordered admission schedules the fresh FIFO.

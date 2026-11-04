@@ -1136,8 +1136,9 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
 
-    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
-        """Force reset a session, creating a new session ID."""
+    def reset_session(self, session_key: str, display_name: Optional[str] = None, *,
+                      preserve_heartbeat: bool = False) -> Optional[SessionEntry]:
+        """Reset the conversation; automatic handoff may retain its heartbeat for transactional transfer."""
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
@@ -1160,7 +1161,7 @@ class SessionStore(
         self._finish_route_transition(
             session_key, end_session_id=old_entry.session_id, end_reason="session_reset",
             create_kwargs=db_create_kwargs, origin=old_entry.origin,
-            display_name=new_entry.display_name, during=" during reset",
+            display_name=new_entry.display_name, during=" during reset", preserve_heartbeat=preserve_heartbeat,
         )
         return new_entry
 

@@ -92,6 +92,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `cron_job` | No | Fire an existing cron job (by ID or name) on each event instead of starting a fresh webhook agent session. The rendered `prompt` becomes transient per-run context; the job's own prompt, skills, model, and delivery settings apply. Mutually exclusive with `deliver_only`. See [Event-Triggered Cron Jobs](#event-triggered-cron-jobs). |
 | `coalesce` | No | Debounce rapid distinct events on the same logical entity into one agent run. Block with a required `key` (payload field or template identifying the entity, e.g. `pull_request.number`), optional `window_seconds` (quiet window, default 30) and `max_wait_seconds` (dispatch cap, default 300). See [Event Coalescing](#event-coalescing). Mutually exclusive with `deliver_only` and `cron_job`. |
 | `mirror_to_session` | No | Default `false`. When `true`, after a successful delivery to a chat platform the delivered message is also written into that chat's session transcript (as a labelled user turn, the same way continuable cron briefs are), so when you reply in that chat the agent knows what it just sent you. See [Replying to a delivery](#replying-to-a-delivery). |
+| `queue_to_session` | No | Exact existing native messaging session key in this route's profile. Queues authenticated evidence into that conversation's durable FIFO instead of starting a webhook conversation. Operator config only; see [Queueing into a conversation](#queueing-into-a-conversation). |
 
 ### Full example
 
@@ -128,6 +129,48 @@ platforms:
               equals: "refs/heads/main"
           deliver: "telegram"
 ```
+
+### Queueing into a conversation
+
+Use `queue_to_session` when an existing conversation must remain the single
+decision-maker for human messages and incoming events:
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      routes:
+        app-events:
+          profile: researcher
+          secret: "${APP_EVENT_SECRET}"
+          queue_to_session: "agent:researcher:discord:dm:123"
+          prompt: "{body}"
+```
+
+The key must name an existing, unsuspended messaging conversation in the same
+profile. It is a literal key, not a payload template. The destination's native
+tool permissions and reply channel apply; webhook `toolsets`, `deliver`,
+`deliver_extra`, and `mirror_to_session` do not create a second execution or reply
+route. Enable this only for an authenticated source appropriate for that
+conversation's capabilities. Event content remains labeled **untrusted evidence**,
+not a human instruction or new operating permission.
+
+Every request must supply a stable provider ID in `X-GitHub-Delivery`, `svix-id`,
+`webhook-id`, or `X-Request-ID`. HTTP 202 includes the native receipt only after
+durable admission; it does not mean inference or reply delivery completed.
+An exact retained delivery replay returns HTTP 200 with the same receipt, including
+after an automatic handoff. Reusing an ID with changed evidence returns HTTP 409.
+Unavailable targets, full queues, and failed native writes return a retryable
+HTTP 503, never a separate webhook agent run. Retired/deleted evidence that cannot
+prove an exact replay is refused rather than treated as a new delivery.
+
+Queue mode cannot be combined with `script`, `coalesce`, `cron_job`, or
+`deliver_only`. Automatic context-reset handoffs preserve queued webhook inputs,
+their retry identities and FIFO order, and the existing native session-heartbeat
+schedule. The successor remains behind its native claim gate during recentering.
+An explicit `/new` or `/reset` remains a conversation boundary; it does not inherit
+the automatic handoff's route-provenance marker or heartbeat schedule.
+
 
 ### Payload Filters
 
