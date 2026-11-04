@@ -441,8 +441,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
-            from gateway.platforms.webhook_queue import validate_queue_route
-            validate_queue_route(name, route)
+            if "queue_to_session" in route:
+                raise ValueError("queue_to_session is operator config only (config.yaml routes)")
             validate_coalesce_config(name, route)
         except ValueError as e:
             logger.warning("[webhook] Dynamic route '%s' skipped: %s", name, e)

@@ -132,7 +132,8 @@ async def test_queue_route_rejects_missing_provider_delivery_identity(monkeypatc
 
 @pytest.mark.parametrize(
     ("option", "value"),
-    [("script", "ignore.py"), ("coalesce", {}), ("cron_job", "daily"), ("deliver_only", True)],
+    [("script", "ignore.py"), ("coalesce", {}), ("cron_job", "daily"), ("deliver_only", True),
+     ("mcp_event", {})],
 )
 def test_queue_route_rejects_incompatible_acknowledgement_paths(option, value):
     from gateway.platforms.webhook_queue import validate_queue_route
@@ -140,3 +141,18 @@ def test_queue_route_rejects_incompatible_acknowledgement_paths(option, value):
     route = {"queue_to_session": "agent:main:discord:dm:42", option: value}
     with pytest.raises(ValueError, match="cannot be combined"):
         validate_queue_route("fixture", route)
+
+
+@pytest.mark.asyncio
+async def test_dynamic_subscription_cannot_queue_into_an_existing_conversation(monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    async with _running_queue(monkeypatch) as (_runner, authority, webhook, owner, url, _finish, _sent):
+        route = dict(webhook._routes["fixture"], secret="queue-fixture-secret")
+        (get_hermes_home() / "webhook_subscriptions.json").write_text(json.dumps({"dynamic": route}))
+        body = json.dumps({"text": "unapproved route evidence"}).encode()
+        async with aiohttp.ClientSession() as client:
+            response = await client.post(url.rsplit("/", 1)[0] + "/dynamic", data=body, headers=_signed(body))
+            assert response.status == 404, await response.text()
+        rows = authority.db._read_all("SELECT target_session_id FROM session_admissions")
+        assert len(rows) == 1 and rows[0]["target_session_id"] == owner

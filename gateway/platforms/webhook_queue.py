@@ -28,6 +28,8 @@ def validate_queue_route(route_name: str, route_config: dict) -> None:
         incompatible.append("cron_job")
     if route_config.get("deliver_only"):
         incompatible.append("deliver_only")
+    if "mcp_event" in route_config:
+        incompatible.append("mcp_event")
     if incompatible:
         raise ValueError(f"[webhook] Route '{route_name}' queue_to_session cannot be combined with "
                          f"{', '.join(incompatible)}")
@@ -48,9 +50,7 @@ async def dispatch_queue_delivery(adapter, *, route_name: str, route_config: dic
                                      raw_message=payload, timestamp=datetime.fromtimestamp(0, UTC))
         from gateway.platforms.webhook_ingress import producer_scope
         async with producer_scope(adapter, ingress_event) as authority:
-            from gateway.platforms.webhook_mcp_events import render_mcp_event_prompt
-            prompt = (render_mcp_event_prompt(adapter, route_config, payload, event_type, route_name)
-                      or adapter._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name))
+            prompt = adapter._render_prompt(route_config.get("prompt", ""), payload, event_type, route_name)
             if skills := route_config.get("skills", []):
                 prompt = adapter._apply_skills(prompt, skills)
             body_digest = hashlib.sha256(raw_body).hexdigest()

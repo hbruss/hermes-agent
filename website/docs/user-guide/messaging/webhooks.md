@@ -164,8 +164,9 @@ Unavailable targets, full queues, and failed native writes return a retryable
 HTTP 503, never a separate webhook agent run. Retired/deleted evidence that cannot
 prove an exact replay is refused rather than treated as a new delivery.
 
-Queue mode cannot be combined with `script`, `coalesce`, `cron_job`, or
-`deliver_only`. Automatic context-reset handoffs preserve queued webhook inputs,
+Queue mode is restricted to operator-configured `config.yaml` routes, never
+agent-created dynamic subscriptions. It cannot be combined with `script`,
+`coalesce`, `cron_job`, `deliver_only`, or `mcp_event`. Automatic context-reset handoffs preserve queued webhook inputs,
 their retry identities and FIFO order, and the existing native session-heartbeat
 schedule. The successor remains behind its native claim gate during recentering.
 An explicit `/new` or `/reset` remains a conversation boundary; it does not inherit

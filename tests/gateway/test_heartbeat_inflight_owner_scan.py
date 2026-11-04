@@ -32,13 +32,15 @@ async def test_inflight_heartbeat_on_the_logical_owner_blocks_another(tmp_path, 
                             request_id='hb-1', payload={'text': 'check', **envelope})
         save_heartbeat('tip', HeartbeatState(prompt='check', interval_seconds=60, created_at=1))
         admitted = []
-        authority = SimpleNamespace(db=db)
+        authority = SimpleNamespace(db=db, _route_turns={})
         authority.logical_owner = lambda sid: SessionAuthority.logical_owner(authority, sid)
 
         async def admit_automation(adapter, event, identity):
             admitted.append(identity)
         authority.admit_automation = admit_automation
-        runner = SimpleNamespace(session_authority=authority)
+        entry = SimpleNamespace(session_id='tip', suspended=False)
+        runner = SimpleNamespace(session_authority=authority, session_store=SimpleNamespace(
+            lookup_by_session_key=lambda key: entry if key == 'route' else None))
         source = SessionSource(platform=Platform.TELEGRAM, chat_id='1', user_id='1')
         await admit_heartbeat(runner, object(), source, 'tip', 'route')
         assert admitted == []
