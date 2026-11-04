@@ -5,7 +5,8 @@ secret (REQUIRED; "INSECURE_NO_AUTH" skips validation, loopback only), prompt te
 deliver/deliver_extra, deliver_only (rendered prompt IS the message), cron_job (fire an existing cron
 job per event; the rendered prompt is transient per-run context; exclusive with deliver_only), mirror_to_session
 (opt-in: a delivered response is also written into the target chat's transcript so follow-ups there have
-context). Per-route rate limiting,
+context), queue_to_session (opt-in: admit authenticated webhook evidence into an existing native conversation).
+Per-route rate limiting,
 idempotency cache, body-size caps checked before reading. Generic HMAC V2 binds a timestamp for
 replay protection; body-only V1 is deprecated but accepted with a warning."""
 
@@ -78,6 +79,15 @@ def _header_delivery_id(headers) -> str:
     """The provider's delivery id (GitHub, Svix, Standard Webhooks, generic), else a fresh one."""
     return headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
         "webhook-id", headers.get("X-Request-ID", uuid.uuid4().hex))))
+
+
+def _stable_provider_delivery_id(headers) -> Optional[str]:
+    """Return an explicitly supplied provider identity; queue routes may not mint retry IDs."""
+    for name in ("X-GitHub-Delivery", "svix-id", "webhook-id", "X-Request-ID"):
+        value = headers.get(name)
+        if value is not None:
+            return value if value.strip() else None
+    return None
 
 
 @dataclass(frozen=True)
@@ -264,6 +274,9 @@ class WebhookAdapter(BasePlatformAdapter):
             raise ValueError(f"[webhook] Route '{name}' uses INSECURE_NO_AUTH secret but is bound to non-loopback "
                              f"host '{self._host}'. INSECURE_NO_AUTH is for local testing only. "
                              f"Refusing to start to prevent accidental exposure.")
+        if secret == _INSECURE_NO_AUTH and "queue_to_session" in route:
+            raise ValueError(f"[webhook] Route '{name}' queue_to_session requires authenticated evidence; "
+                             "INSECURE_NO_AUTH is not allowed.")
         if route.get("deliver_only"):
             deliver = route.get("deliver", "log")
             if not deliver or deliver == "log":
@@ -273,6 +286,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 raise ValueError(f"[webhook] Route '{name}' sets both deliver_only and cron_job. They are mutually "
                                  f"exclusive: deliver_only pushes the rendered template as a message, cron_job fires "
                                  f"an existing cron job (which handles its own delivery).")
+        from gateway.platforms.webhook_queue import validate_queue_route
+        validate_queue_route(name, route)
         validate_coalesce_config(name, route)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -429,6 +444,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
+            if "queue_to_session" in route:
+                raise ValueError("queue_to_session is operator config only (config.yaml routes)")
             validate_coalesce_config(name, route)
         except ValueError as e:
             logger.warning("[webhook] Dynamic route '%s' skipped: %s", name, e)
@@ -668,7 +685,14 @@ class WebhookAdapter(BasePlatformAdapter):
         if error_response is not None:
             return error_response
         headers = request.headers
-        delivery_id = _header_delivery_id(headers)
+        from gateway.platforms.webhook_queue import is_queue_route
+        queue_mode = is_queue_route(route_config)
+        if queue_mode:
+            delivery_id = _stable_provider_delivery_id(headers)
+            if delivery_id is None:
+                return _json_error("Queue route requires a stable provider delivery ID", 400)
+        else:
+            delivery_id = _header_delivery_id(headers)
         # A parked profile is retried, before any delivery id is recorded. The check resolves
         # ``profile_routes`` against the very source admission builds for this delivery.
         from gateway.platforms.webhook_ingress import parked_profile_refusal
@@ -683,10 +707,11 @@ class WebhookAdapter(BasePlatformAdapter):
         payload = self._parse_body(raw_body)
         if payload is _UNPARSEABLE:
             return _json_error("Cannot parse body", 400)
-        mcp_control = await handle_mcp_event_control(self, route_name, route_config, payload, profile)
-        if mcp_control is not None:
-            return mcp_control
-        delivery_id = mcp_event_delivery_id(route_config, payload) or delivery_id
+        if not queue_mode:
+            mcp_control = await handle_mcp_event_control(self, route_name, route_config, payload, profile)
+            if mcp_control is not None:
+                return mcp_control
+            delivery_id = mcp_event_delivery_id(route_config, payload) or delivery_id
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
         allowed_events = route_config.get("events", [])
@@ -697,6 +722,11 @@ class WebhookAdapter(BasePlatformAdapter):
         if not self._route_processor.route_filters_match(route_config, payload, event_type, request.headers):
             logger.info("[webhook] filtered event=%s route=%s", event_type, route_name)
             return web.json_response({"status": "ignored", "reason": "filter", "route": route_name})
+        if queue_mode:
+            from gateway.platforms.webhook_queue import dispatch_queue_delivery
+            return await dispatch_queue_delivery(
+                self, route_name=route_name, route_config=route_config, profile=profile, payload=payload,
+                raw_body=raw_body, event_type=event_type, external_delivery_id=delivery_id)
         # Script, prompt render and skill lookup read the profile's home (skills/, config); the runner
         # only enters the routed profile's scope later around handle_message, so enter it here.
         # See #67277.

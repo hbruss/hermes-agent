@@ -371,9 +371,14 @@ class GatewayTurnPersistenceMixin:
     async def _hmwa_rotate_exhausted_session(self, session_entry, session_key, source):
         """The compression-exhaustion auto-reset itself; returns the route's (fresh) entry."""
         logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
+        from gateway.session_authorities import active_authority
+        from gateway.session_authority import keyed_turn
         from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
-        # Messages queued behind the exhausted turn still run, on the fresh session (unlike /new).
-        new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
+        # Match full-handoff cutover ordering: an inbound route producer resolves on one side of reset.
+        authority = active_authority(self)
+        route_turn = keyed_turn(authority._route_turns, session_key) if authority else nullcontext()
+        async with route_turn:
+            new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
         try:
             await move_route_wakes(self, session_key, session_entry.session_id)
             self._evict_cached_agent(session_key)

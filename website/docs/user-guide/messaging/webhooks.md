@@ -79,7 +79,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | Property | Required | Description |
 |----------|----------|-------------|
 | `events` | No | List of event types to accept (e.g. `["pull_request"]`). If empty, all events are accepted. Event type is read from `X-GitHub-Event`, `X-GitLab-Event`, or `event_type` in the payload. |
-| `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
+| `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation); not allowed with `queue_to_session`. |
 | `profile` | No | Profile authorized to execute this route when `gateway.multiplex_profiles` is enabled. Omit it for a default-profile-only route; set a profile name (for example `coder`) to bind the route and its secret to `/p/coder/webhooks/<route>`. Dynamic subscriptions set it with `hermes webhook subscribe <name> --route-profile coder`. |
 | `prompt` | No | Template string with dot-notation payload access (e.g. `{pull_request.title}`). If omitted, the full JSON payload is dumped into the prompt. Payload fields are untrusted — see [Authenticated does not mean trusted](#authenticated-does-not-mean-trusted). |
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
@@ -92,6 +92,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `cron_job` | No | Fire an existing cron job (by ID or name) on each event instead of starting a fresh webhook agent session. The rendered `prompt` becomes transient per-run context; the job's own prompt, skills, model, and delivery settings apply. Mutually exclusive with `deliver_only`. See [Event-Triggered Cron Jobs](#event-triggered-cron-jobs). |
 | `coalesce` | No | Debounce rapid distinct events on the same logical entity into one agent run. Block with a required `key` (payload field or template identifying the entity, e.g. `pull_request.number`), optional `window_seconds` (quiet window, default 30) and `max_wait_seconds` (dispatch cap, default 300). See [Event Coalescing](#event-coalescing). Mutually exclusive with `deliver_only` and `cron_job`. |
 | `mirror_to_session` | No | Default `false`. When `true`, after a successful delivery to a chat platform the delivered message is also written into that chat's session transcript (as a labelled user turn, the same way continuable cron briefs are), so when you reply in that chat the agent knows what it just sent you. See [Replying to a delivery](#replying-to-a-delivery). |
+| `queue_to_session` | No | Exact existing native messaging session key in this route's profile. Queues authenticated evidence into that conversation's durable FIFO instead of starting a webhook conversation. Operator config only; see [Queueing into a conversation](#queueing-into-a-conversation). |
 
 ### Full example
 
@@ -128,6 +129,57 @@ platforms:
               equals: "refs/heads/main"
           deliver: "telegram"
 ```
+
+### Queueing into a conversation
+
+Use `queue_to_session` when an existing conversation must remain the single
+decision-maker for human messages and incoming events:
+
+```yaml
+platforms:
+  webhook:
+    extra:
+      routes:
+        app-events:
+          profile: researcher
+          secret: "${APP_EVENT_SECRET}"
+          queue_to_session: "agent:researcher:discord:dm:123"
+          prompt: "{body}"
+```
+
+The key must name an existing, unsuspended messaging conversation in the same
+profile. It is a literal key, not a payload template. The destination's native
+tool permissions and reply channel apply; webhook `toolsets`, `deliver`,
+`deliver_extra`, and `mirror_to_session` do not create a second execution or reply
+route. Enable this only for an authenticated source appropriate for that
+conversation's capabilities; `INSECURE_NO_AUTH` is refused even on loopback.
+Event content remains labeled **untrusted evidence**, not a human instruction
+or new operating permission.
+
+Every request must supply a stable provider ID in `X-GitHub-Delivery`, `svix-id`,
+`webhook-id`, or `X-Request-ID`. HTTP 202 includes the native receipt only after
+durable admission; it does not mean inference or reply delivery completed.
+An exact retained delivery replay returns HTTP 200 with the same receipt, including
+after an automatic handoff. Reusing an ID with changed evidence returns HTTP 409.
+Unavailable targets, full queues, and failed native writes return a retryable
+HTTP 503, never a separate webhook agent run. Retired/deleted evidence that cannot
+prove an exact replay is refused rather than treated as a new delivery.
+Provider IDs establish retry idempotency, not a new cryptographic replay defense.
+Queue mode retains the receiver's existing provider authentication schemes,
+including GitLab token authentication; not every scheme signs the delivery ID or
+body. Use a source and transport appropriate for the destination's capabilities.
+
+Queue mode is restricted to operator-configured `config.yaml` routes, never
+agent-created dynamic subscriptions. It cannot be combined with `script`,
+`coalesce`, `cron_job`, `deliver_only`, or `mcp_event`. Automatic context-reset handoffs preserve queued webhook inputs,
+their retry identities and FIFO order, and the existing native session-heartbeat
+schedule. The successor remains behind its native claim gate during recentering.
+If the queued-input transfer fails, the error is reported after a guarded attempt
+to restore the preceding route and its settings, retaining accepted work for retry.
+This does not claim a crash-atomic transaction across the routing and session stores.
+An explicit `/new` or `/reset` remains a conversation boundary; it does not inherit
+the automatic handoff's route-provenance marker or heartbeat schedule.
+
 
 ### Payload Filters
 
@@ -609,7 +661,7 @@ binds that secret to one execution target. A route without `profile` is
 default-profile-only. A request carrying a valid route signature is still
 rejected if its `/p/<profile>/` prefix does not match the route binding.
 
-`INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`). If it is combined with a non-loopback bind such as `0.0.0.0` or a LAN IP, the adapter refuses to start — this prevents accidentally exposing an unauthenticated endpoint on a public interface.
+`INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`) and the route does not use `queue_to_session`. A non-loopback bind such as `0.0.0.0` or a LAN IP, or a conversation queue route, causes the adapter to refuse startup. Queue routes always require authenticated requests.
 
 ### Rate limiting
 

@@ -305,11 +305,13 @@ def _mark_retired(conn, key, *, expires, **fields):
 
 
 def retire_routes(conn, session_ids, *, expiring=()):
+    from hermes_state_route_rehome import _ROUTE_PROVENANCE_PREFIX
     expiring = set(expiring)
     for sid in session_ids:
         _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid in expiring, own=True)
         conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.api.settings.v1.' + sid,))
         conn.execute('DELETE FROM state_meta WHERE key=?', (VIEWER_CLOSE_PREFIX + sid,))
+        conn.execute('DELETE FROM state_meta WHERE key=?', (_ROUTE_PROVENANCE_PREFIX + sid,))
     targets = set(session_ids)
     for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
         if entry_session_id(row['entry_json']) in targets:

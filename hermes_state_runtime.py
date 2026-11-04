@@ -377,14 +377,21 @@ def check_replaced_input(conn, admission_id: str, binding: str) -> None:
 
 
 def rehome_queued_inputs(db, *, epoch: int, old_session_id: str, new_session_id: str,
-                         principal_prefix: str) -> list[str]:
-    """Re-target the old owner's still-queued ``principal_prefix*`` admissions onto
-    ``new_session_id`` in one transaction (the compression-exhaustion auto-reset). Each row keeps
-    its admission id, request id and seq, so FIFO order and retry dedupe survive; the digest is
-    re-keyed to the new target. Nothing moves while the old FIFO holds an ``unknown`` row (the
-    operator's to resume). Returns the moved admission ids in FIFO order."""
+                         principal_prefix: str, route_key: str | None = None,
+                         heartbeat_session_id: str | None = None) -> list[str]:
+    """Move queued inputs in one transaction, retaining admission/request IDs and FIFO order.
+
+    An automatic messaging-route reset also carries its webhook inputs, heartbeat admissions
+    and heartbeat schedule. Other automation remains bound to its original conversation.
+    Nothing moves while the old FIFO holds unknown work.
+    """
     for value in (old_session_id, new_session_id, principal_prefix):
         _text(value)
+    if route_key is not None:
+        _text(route_key)
+        _text(heartbeat_session_id)
+    elif heartbeat_session_id is not None:
+        raise RuntimeStoreError('invalid_params')
     def write(conn):
         _epoch(conn, epoch)
         _session(conn, new_session_id)
@@ -394,16 +401,25 @@ def rehome_queued_inputs(db, *, epoch: int, old_session_id: str, new_session_id:
         rows = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' "
                             "AND substr(principal_id,1,?)=? ORDER BY seq",
                             (old_session_id, len(principal_prefix), principal_prefix)).fetchall()
+        moved = []
+        if route_key is not None:
+            from hermes_state_route_rehome import rehome_route_automation
+            moved = rehome_route_automation(
+                db, conn, old_session_id=old_session_id, new_session_id=new_session_id,
+                route_key=route_key, heartbeat_session_id=heartbeat_session_id)
         for row in rows:
             digest = admission_fingerprint(canonical_target=new_session_id, payload={
                 'input': json.loads(row['payload_json']), 'intent': row['intent']})
             conn.execute("UPDATE session_admissions SET target_session_id=?,lineage_json=?,payload_digest=? "
                          "WHERE admission_id=? AND status='queued'",
                          (new_session_id, json.dumps([new_session_id]), digest, row['admission_id']))
-        if rows:
+        if rows or moved:
             for sid in (old_session_id, new_session_id):
                 conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (sid,))
-        return [row['admission_id'] for row in rows]
+        selected = {row['admission_id'] for row in rows} | set(moved)
+        return [row[0] for row in conn.execute(
+            "SELECT admission_id FROM session_admissions WHERE target_session_id=? AND status='queued' ORDER BY seq",
+            (new_session_id,)) if row[0] in selected] if selected else []
     return db._execute_write(write)
 
 

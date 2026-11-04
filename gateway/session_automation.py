@@ -331,15 +331,20 @@ def _route_identity(source):
 
 
 def committed_route_envelope(authority, entry):
-    """The route's last committed native envelope with connector provenance (what a producer turn
-    borrows), or ``None`` while no human message was admitted there."""
+    """Committed native provenance for this owner, including its automatic-reset inheritance.
+
+    Manual /new and unrelated conversations do not inherit the automatic-reset marker.
+    """
     from hermes_state_runtime import list_session_admissions
     # Admissions belong to the logical root; ``entry.session_id`` is only the transcript tip.
     prior = list_session_admissions(authority.db, session_id=authority.logical_owner(entry.session_id),
                                     pending_only=False)
     envelope = next((r['payload']['native_text_v1'] for r in reversed(prior)
                      if 'native_text_v1' in r['payload']), None)
-    return envelope if envelope is not None and 'provenance' in envelope else None
+    if envelope is not None:
+        return envelope if 'provenance' in envelope else None
+    from hermes_state_route_rehome import load_route_provenance
+    return load_route_provenance(authority.db, authority.logical_owner(entry.session_id), entry.session_key)
 
 
 def snapshot_automation(authority, adapter, event, identity):
@@ -580,7 +585,9 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     ordered with native admissions, not atomically across the two stores: a redelivery that
     resolves the route to the fresh session commits after the move and dedupes onto the moved row,
     and one that reserved the old route before the rotation is retargeted at commit
-    (``_admit_native_write``). Returns ``(entry, release)``. Until the caller runs ``release()``
+    (``_admit_native_write``). A failed move attempts a guarded native repoint to the exact previous
+    route snapshot, then propagates the error; a concurrent explicit route switch is never overwritten.
+    Returns ``(entry, release)``. Until the caller runs ``release()``
     (once, after its conversation cleanup and topic binding sync, also on failure) the fresh
     session's ``claim_gate`` is held, so no scheduler (a redelivery, a moved route wake, this
     move) starts a turn there against stale state; ``release()`` then schedules its FIFO."""
@@ -599,19 +606,32 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     from hermes_state_runtime import rehome_queued_inputs
 
     def rotate_and_move():
-        entry = runner.session_store.reset_session(session_key)
+        previous = runner.session_store.lookup_by_session_key(session_key)
+        if previous is None:
+            return None, None, []
+        entry = runner.session_store.reset_session(
+            session_key, preserve_heartbeat=True, expected_entry=previous)
         if entry is None:
             return None, None, []
-        new = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
-        if new == old:
-            return entry, None, []
-        if authority.db.get_session(new.session_id) is None:
-            authority.db.create_session(new.session_id, source=live.source.platform.value)
-        # An admission that reserved the old route before this rotation commits after it.
+        try:
+            new = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
+            if new == old:
+                return entry, None, []
+            if authority.db.get_session(new.session_id) is None:
+                authority.db.create_session(new.session_id, source=live.source.platform.value)
+            moved = rehome_queued_inputs(
+                authority.db, epoch=authority.epoch, old_session_id=old.session_id,
+                new_session_id=new.session_id, principal_prefix='messaging:',
+                route_key=session_key, heartbeat_session_id=old_session_id)
+        except BaseException:
+            restored = runner.session_store.switch_session(
+                session_key, previous.session_id, expected_session_id=entry.session_id, restore_entry=previous)
+            if restored is None:
+                raise RuntimeStoreError('admission_conflict')
+            raise
+        # Publish the retarget only after the queued work's transaction commits.
         authority.rotated_owners[old.session_id] = session_key
-        return entry, new, rehome_queued_inputs(
-            authority.db, epoch=authority.epoch, old_session_id=old.session_id,
-            new_session_id=new.session_id, principal_prefix='messaging:')
+        return entry, new, moved
 
     async def fence(result):
         # In the write's own task step, before any later ordered admission schedules the fresh FIFO.

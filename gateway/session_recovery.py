@@ -288,7 +288,8 @@ class SessionRecoveryMixin:
             row=recovered, session_key=session_key, source=source, now=now)
         return entry, migrated_legacy
 
-    def _promote_session_reset(self, session_key: str, session_id: str, reason: str, *, log) -> None:
+    def _promote_session_reset(self, session_key: str, session_id: str, reason: str, *, log,
+                               preserve_heartbeat: bool = False) -> None:
         """End *session_id* with *reason* via ``promote_to_session_reset`` (``end_session`` on old
         SessionDBs). Promote, not plain end: a row already ended with a recoverable accidental
         reason (agent_close / ws_orphan_reap) must be upgraded to the explicit boundary, or
@@ -303,7 +304,7 @@ class SessionRecoveryMixin:
             # Stop the departed conversation's schedule in its owning profile, even when
             # the in-memory watch still holds a pre-reset session id.
             heartbeat_key = f"heartbeat:{session_id}"
-            if db.get_meta(heartbeat_key):
+            if not preserve_heartbeat and db.get_meta(heartbeat_key):
                 db.set_meta(heartbeat_key, "")
         except Exception as exc:
             log(exc)
@@ -384,7 +385,7 @@ class SessionRecoveryMixin:
     def _finish_route_transition(
         self, session_key: str, *, end_session_id: Optional[str], end_reason: str,
         create_kwargs: Optional[dict[str, Any]], origin: Optional[SessionSource],
-        display_name: Optional[str], during: str = "") -> None:
+        display_name: Optional[str], during: str = "", preserve_heartbeat: bool = False) -> None:
         """SQLite side of a routing transition, outside ``_lock``: promote the predecessor row to an
         explicit reset boundary (with the specific reason so state.db is auditable, e.g.
         ``suspended`` vs plain ``session_reset``), then INSERT the new row + routing
@@ -395,7 +396,7 @@ class SessionRecoveryMixin:
             close_session_run(end_session_id)
         if self._db_for_key(session_key) and end_session_id:
             self._promote_session_reset(
-                session_key, end_session_id, end_reason,
+                session_key, end_session_id, end_reason, preserve_heartbeat=preserve_heartbeat,
                 log=lambda e: logger.warning(
                     "Failed to end predecessor session row %s for %s%s: %s — the old row remains "
                     "open and may win restart recovery until the next successful peer refresh",
