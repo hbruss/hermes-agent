@@ -212,6 +212,10 @@ def restore_provenance(runner, source, provenance):
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
     source._transport_adapter_ref = weakref.ref(adapter)
     source._authorization_profile_home = home
+    # The adapter instance may be replaced while this source remains in the native FIFO.
+    from gateway.session_identity import canonical_identity
+    canonical_identity(source, runner=runner, adapter=adapter,
+                       transport_profile=provenance.get('transport_profile'), primary_home=home)
     return runtime_home
 
 
