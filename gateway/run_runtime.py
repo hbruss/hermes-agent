@@ -562,9 +562,10 @@ async def recover_profile_native_sessions(runner, authority):
     with owner_scope(authority):
         pending = {row['target_session_id'] for row in authority.db._read_all(
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
-        bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
+        bindings = [(owner, source, runner._adapter_for_source(source))
                     for entry in runner.session_store.list_sessions() if entry.origin is not None
-                    for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
+                    for owner in [authority.logical_owner(entry.session_id)] if owner in pending
+                    for source in [runner._restored_source(entry)]]
         outcome = await authority.recover_native_sessions(bindings)
     for sid, verdict in outcome.items():
         logger.info('Native session startup recovery %s (%s): %s', sid, authority.profile_id, verdict)
